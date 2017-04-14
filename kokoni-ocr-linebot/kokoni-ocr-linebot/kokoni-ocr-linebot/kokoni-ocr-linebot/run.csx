@@ -1,4 +1,4 @@
-﻿#r "Newtonsoft.Json"
+#r "Newtonsoft.Json"
 #r "System.Configuration"
 #r "Microsoft.WindowsAzure.Storage"
 
@@ -21,7 +21,6 @@ using Microsoft.WindowsAzure.Storage.RetryPolicies;
 /// <returns></returns>
 public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceWriter log)
 {
-    # テスト
     log.Info("Start");
 
     // リクエストJSONをパース
@@ -36,7 +35,6 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
     string containerName = "contents";
 
     // WebAppsのプロパティ設定からデータを取得
-    var ChannelAccessToken = ConfigurationManager.AppSettings["ChannelAccessToken"];
     var SubscriptionKey = ConfigurationManager.AppSettings["SubscriptionKey"];
 
     // リクエストデータからデータを取得
@@ -53,28 +51,13 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
     }
 
     log.Info(messageId);
-    log.Info(messageType);
-    log.Info($"https://api.line.me/v2/bot/message/{messageId}/content");
 
     if (messageType != "image") return null;
 
     Stream responsestream = new MemoryStream();
 
-    // 画像を取得するLine APIを実行
-    using (var getContentsClient = new HttpClient())
-    {
-        //　認証ヘッダーを追加
-        getContentsClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {ChannelAccessToken}");
-
-        // 非同期でPOST
-        var res = await getContentsClient.GetAsync($"https://api.line.me/v2/bot/message/{messageId}/content");
-        responsestream = await res.Content.ReadAsStreamAsync();
-    }
-
-    // 取得したファイルをストレージに保管
-    await PutLineContentsAsync(responsestream,containerName, fileName);
-
-    var OCRStream = await GetLineContentsFromStorageAsync(containerName, fileName);
+    // Lineから指定MessageIdの画像を再取得
+    responsestream = await GetLineContents(messageId);
 
     var OCRResponse = new HttpResponseMessage();
 
@@ -86,6 +69,7 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
         string detectOrientation = "true";
         var uri = $"https://westus.api.cognitive.microsoft.com/vision/v1.0/ocr?language={language}&detectOrientation={detectOrientation}";
 
+        // ComputerVisionAPIへのリクエスト情報を作成
         HttpRequestMessage OCRRequest = new HttpRequestMessage(HttpMethod.Post, uri);
         OCRRequest.Content = new StreamContent(responsestream);
         OCRRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
@@ -93,56 +77,106 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
         // リクエストヘッダーの作成
         getOCRDataClient.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", $"{SubscriptionKey}");
 
-        OCRResponse = await getOCRDataClient.SendAsync(OCRStream);
-
-        log.Info(OCRResponse.ToString());
+        // ComputerVisionAPIにリクエスト
+        OCRResponse = await getOCRDataClient.SendAsync(OCRRequest);
     }
 
-
-
     // ComputerVisionAPIのレスポンスをパースして文章に
+    jsonContent = await OCRResponse.Content.ReadAsStringAsync();
+    log.Info(jsonContent);
+    OCR_Response ocr_data = JsonConvert.DeserializeObject<OCR_Response>(jsonContent);
 
-    // TranslatorAPIにパースした文字列をリクエストリクエスト
+    string words= String.Empty;
 
-    // 日本語に翻訳されたレスポンスをLine ReplyAPIにリクエスト
-
-    // 取得した画像をAzureStorageに保存
+    if(ocr_data.regions.Any())
+    {
+        foreach(var regions in ocr_data.regions)
+        {
+            foreach(var line in regions.lines)
+            {
+                foreach(var word in line.words)
+                {
+                    words = words + word.text;
+                }
+                words = words + Environment.NewLine;
+            }
+        }
+    }
+    else
+    {
+        words = "There is no words!!";
+    }
 
     // リプライデータの作成
-    // var content = CreateResponse(replyToken, praiseWord, log, messageType);
-    /*
-        // JSON形式に変換
-        var reqData = JsonConvert.SerializeObject(content);
+    var content = CreateResponse(replyToken, words, log);
 
-        // レスポンスの作成
-        using (var client = new HttpClient())
-        {
-            // リクエストデータを作成
-            // ※HttpClientで[application/json]をHTTPヘッダに追加するときは下記のコーディングじゃないとエラーになる
-            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, "https://api.line.me/v2/bot/message/reply");
-            request.Content = new StringContent(reqData, Encoding.UTF8, "application/json");
+    // 日本語に翻訳されたレスポンスをLine ReplyAPIにリクエスト
+    await PutLineReply(content);
 
-            //　認証ヘッダーを追加
-            client.DefaultRequestHeaders.Add("Authorization", $"Bearer {ChannelAccessToken}");
+    // 取得した画像をAzureStorageに保存
+    // Lineから指定MessageIdの画像を取得
+    responsestream = await GetLineContents(messageId);
 
-            // 非同期でPOST
-            var res = await client.SendAsync(request);
+    // 取得したファイルをストレージに保管
+    await PutLineContentsToStorageAsync(responsestream,containerName, fileName);
 
-            return req.CreateResponse(res.StatusCode);
-        }
-        */
+    return req.CreateResponse("200");
+}
 
-    return null;
+/// <summary>
+/// Lineからコンテンツを取得
+/// </summary>
+/// <returns>Stream</returns>
+static async Task<Stream> GetLineContents(string messageId)
+{
+    Stream responsestream = new MemoryStream();
+
+    // 画像を取得するLine APIを実行
+    using (var getContentsClient = new HttpClient())
+    {
+        //　認証ヘッダーを追加
+        getContentsClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {ConfigurationManager.AppSettings["ChannelAccessToken"]}");
+
+        // 非同期でPOST
+        var res = await getContentsClient.GetAsync($"https://api.line.me/v2/bot/message/{messageId}/content");
+        responsestream = await res.Content.ReadAsStreamAsync();
+    }
+
+    return responsestream;
+}
+
+/// <summary>
+/// Lineににreplyを送信する
+/// </summary>
+/// <returns>Stream</returns>
+static async Task PutLineReply(Response content)
+{    
+    // JSON形式に変換
+    var reqData = JsonConvert.SerializeObject(content);
+    
+    // レスポンスの作成
+    using (var client = new HttpClient())
+    {
+        // リクエストデータを作成
+        // ※HttpClientで[application/json]をHTTPヘッダに追加するときは下記のコーディングじゃないとエラーになる
+        HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, "https://api.line.me/v2/bot/message/reply");
+        request.Content = new StringContent(reqData, Encoding.UTF8, "application/json");
+
+        //　認証ヘッダーを追加
+        client.DefaultRequestHeaders.Add("Authorization", $"Bearer {ConfigurationManager.AppSettings["ChannelAccessToken"]}");
+
+        // 非同期でPOST
+        var res = await client.SendAsync(request);
+    }
 }
 
 /// <summary>
 /// Lineサーバから取得したStreamを指定ストレージにアップロード
 /// </summary>
-/// <returns>string</returns>
 static async Task PutLineContentsToStorageAsync(Stream stream,string ContainerName,string PathWithFileName)
 {
     // ストレージアクセス情報の作成
-    var storageAccount = CloudStorageAccount.Parse(ConfigurationMsanager.AppSettings["AzureStorageAccount"]);
+    var storageAccount = CloudStorageAccount.Parse(ConfigurationManager.AppSettings["AzureStorageAccount"]);
     var blobClient = storageAccount.CreateCloudBlobClient();
 
     // retry設定 3秒秒3回
@@ -168,7 +202,7 @@ static async Task PutLineContentsToStorageAsync(Stream stream,string ContainerNa
 /// <summary>
 /// 指定ストレージからコンテンツを取得
 /// </summary>
-/// <returns>string</returns>
+/// <returns>Stream</returns>
 static async Task<Stream> GetLineContentsFromStorageAsync(string ContainerName, string PathWithFileName)
 {
     // ストレージアクセス情報の作成
@@ -180,21 +214,13 @@ static async Task<Stream> GetLineContentsFromStorageAsync(string ContainerName, 
 
     var container = blobClient.GetContainerReference(ContainerName);
 
-    // ストレージアクセスポリシーの設定
-    container.SetPermissions(
-        new BlobContainerPermissions
-        {
-            PublicAccess = BlobContainerPublicAccessType.Off,
-        });
-
-    // Blob へファイルをアップロード
+    // Blob からダウンロード
     var blob = container.GetBlockBlobReference(PathWithFileName);
 
-    using (var memoryStream = new MemoryStream())
-    {
-        await blob.DownloadToStreamAsync(memoryStream);
-    }
-
+    var memoryStream = new MemoryStream();
+    
+    await blob.DownloadToStreamAsync(memoryStream);
+    
     return memoryStream;
 }
 
@@ -206,7 +232,7 @@ static async Task<Stream> GetLineContentsFromStorageAsync(string ContainerName, 
 /// <param name="log"></param>
 /// <param name="messageType"></param>
 /// <returns></returns>
-static Response CreateResponse(string token, string praiseWord, TraceWriter log, string messageType = "")
+static Response CreateResponse(string token,string translateWord, TraceWriter log)
 {
     Response res = new Response();
     Messages msg = new Messages();
@@ -216,24 +242,14 @@ static Response CreateResponse(string token, string praiseWord, TraceWriter log,
     res.messages = new List<Messages>();
 
     // メッセージタイプがtext以外は単一のレスポンス情報とする
-    if (messageType == "text")
-    {
-        msg.type = "text";
-        msg.text = praiseWord;
-        res.messages.Add(msg);
-
-    }
-    else
-    {
-        msg.type = "text";
-        msg.text = "画像や動画を見せられても・・・。褒める事が出来るのはあなたの事だけです。";
-        res.messages.Add(msg);
-    }
+    msg.type = "text";
+    msg.text = translateWord;
+    res.messages.Add(msg);
 
     return res;
 }
 
-
+// ******************************************************
 //　リクエスト
 public class Request
 {
@@ -264,8 +280,9 @@ public class message
     public string type { get; set; }
     public string text { get; set; }
 }
+// ******************************************************
 
-
+// ******************************************************
 // レスポンス
 public class Response
 {
@@ -279,3 +296,31 @@ public class Messages
     public string type { get; set; }
     public string text { get; set; }
 }
+// ******************************************************
+
+
+// ******************************************************
+// OCRから返却されたデータ
+public class OCR_Response
+{
+    public string language { get; set; }
+    public double textAngle { get; set; }
+    public string orientation { get; set; }
+    public List<Region> regions { get; set; }
+}
+public class Region
+{
+    public string boundingBox { get; set; }
+    public List<Line> lines { get; set; }
+}
+public class Line
+{
+    public string boundingBox { get; set; }
+    public List<Word> words { get; set; }
+}
+public class Word
+{
+    public string boundingBox { get; set; }
+    public string text { get; set; }
+}
+// ******************************************************
