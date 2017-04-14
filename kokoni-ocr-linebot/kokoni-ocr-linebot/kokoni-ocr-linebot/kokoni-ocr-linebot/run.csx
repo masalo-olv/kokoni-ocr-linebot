@@ -21,6 +21,7 @@ using Microsoft.WindowsAzure.Storage.RetryPolicies;
 /// <returns></returns>
 public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceWriter log)
 {
+    # テスト
     log.Info("Start");
 
     // リクエストJSONをパース
